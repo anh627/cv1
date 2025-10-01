@@ -1,3 +1,5 @@
+// src/components/go-game/components/GoGame.tsx
+
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { produce } from 'immer';
 
@@ -5,26 +7,26 @@ import { produce } from 'immer';
 import { 
   StoneType, Stone, GameMode, GameStatus, Position, 
   GameMove, Captures, GameScore, GameSettings 
-} from './types';
-import { DEFAULT_SETTINGS, BOARD_SIZES } from './constants';
+} from '../types';
+import { DEFAULT_SETTINGS, BOARD_SIZES } from '../constants';
 
-// Import utils với placeHandicapStones
+// Import utils
 import { 
   makeEmptyBoard, inBounds, tryPlay, generateStarPoints,
-  getGroupAndLiberties, placeHandicapStones
-} from './utils/board';
-import { pickAiMove } from './utils/ai';
-import { exportToSGF, importFromSGF } from './utils/sgf';
+  getGroupAndLiberties 
+} from '../utils/board';
+import { pickAiMove } from '../utils/ai';
+import { exportToSGF, importFromSGF } from '../utils/sgf';
 
 // Import components
-import { StoneComponent } from './components/StoneComponent';
-import { BoardCell } from './components/BoardCell';
-import { TimerDisplay } from './components/TimerDisplay';
-import { TutorialModal } from './components/TutorialModal';
-import { ScoreModal } from './components/ScoreModal';
+import { StoneComponent } from './StoneComponent';
+import { BoardCell } from './BoardCell';
+import { TimerDisplay } from './TimerDisplay';
+import { TutorialModal } from './TutorialModal';
+import { ScoreModal } from './ScoreModal';
 
 const GoGame: React.FC = () => {
-  // State declarations
+  // ========== TẤT CẢ STATE VÀ LOGIC GỐC ==========
   const [animatingCaptures, setAnimatingCaptures] = useState<Position[]>([]);
   const [gameMode, setGameMode] = useState<GameMode>('local');
   const [settings, setSettings] = useState<GameSettings>(DEFAULT_SETTINGS);
@@ -47,28 +49,19 @@ const GoGame: React.FC = () => {
   const [showTutorial, setShowTutorial] = useState(false);
   const [isLoadingAI, setIsLoadingAI] = useState(false);
   
-  // Refs
-  const boardHistoryRef = useRef<StoneType[][][]>([]);
+  const koHistoryRef = useRef<StoneType[][] | null>(null);
   const aiMoveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const boardHistoryRef = useRef<StoneType[][][]>([]);
 
   const getAIColor = useCallback((): StoneType => {
     return settings.humanColor === 'black' ? Stone.WHITE : Stone.BLACK;
   }, [settings.humanColor]);
 
   const initializeGame = useCallback(() => {
-    let newBoard = makeEmptyBoard(settings.boardSize);
-    
-    // Đặt quân chấp nếu có (chỉ cho chế độ local)
-    if (settings.handicap > 0 && gameMode === 'local') {
-      const handicapPositions = placeHandicapStones(settings.boardSize, settings.handicap);
-      handicapPositions.forEach(pos => {
-        newBoard[pos.y][pos.x] = Stone.BLACK;
-      });
-    }
-    
+    const newBoard = makeEmptyBoard(settings.boardSize);
     setBoard(newBoard);
-    setCurrentPlayer(settings.handicap > 0 ? Stone.WHITE : Stone.BLACK); // Trắng đi trước nếu có chấp
+    setCurrentPlayer(Stone.BLACK);
     setCaptures({ black: 0, white: 0 });
     setMoveHistory([]);
     setGameStatus('playing');
@@ -83,15 +76,13 @@ const GoGame: React.FC = () => {
       return now;
     });
     setIsTimerActive(true);
-    boardHistoryRef.current = []; // Reset board history
+    koHistoryRef.current = null;
+    boardHistoryRef.current = [];
     
-    // AI đi trước nếu cần
-    if (gameMode === 'ai' && 
-        ((settings.handicap > 0 && settings.humanColor === 'black') || 
-         (settings.handicap === 0 && settings.humanColor === 'white'))) {
+    if (gameMode === 'ai' && settings.humanColor === 'white') {
       setTimeout(() => handleAIMove(), 500);
     }
-  }, [settings, gameMode]);
+  }, [settings.boardSize, settings.humanColor, settings.timePerMove, gameMode]);
 
   const cleanup = useCallback(() => {
     if (aiMoveTimeoutRef.current) {
@@ -112,8 +103,7 @@ const GoGame: React.FC = () => {
     if (gameMode === 'ai' && currentPlayer === getAIColor()) {
       return false;
     }
-    // Truyền board history thay vì ko board
-    const result = tryPlay(board, x, y, currentPlayer, boardHistoryRef.current);
+    const result = tryPlay(board, x, y, currentPlayer, koHistoryRef.current);
     return result.legal;
   }, [board, gameStatus, currentPlayer, gameMode, getAIColor]);
 
@@ -205,8 +195,7 @@ const GoGame: React.FC = () => {
     setIsLoadingAI(true);
     aiMoveTimeoutRef.current = setTimeout(() => {
       try {
-        // AI sử dụng board history
-        const aiMove = pickAiMove(board, currentPlayer, settings.difficulty, boardHistoryRef.current);
+        const aiMove = pickAiMove(board, currentPlayer, settings.difficulty, koHistoryRef.current);
         setIsLoadingAI(false);
         
         if (aiMove && aiMove.x !== -1) {
@@ -225,17 +214,11 @@ const GoGame: React.FC = () => {
   const handlePlaceStone = useCallback((position: Position) => {
     if (!isValidMove(position) && !(gameMode === 'ai' && currentPlayer === getAIColor())) return;
     
-    // Truyền board history thay vì ko board
-    const result = tryPlay(board, position.x, position.y, currentPlayer, boardHistoryRef.current);
+    const result = tryPlay(board, position.x, position.y, currentPlayer, koHistoryRef.current);
     if (!result.legal || !result.board) return;
 
-    // Lưu board hiện tại vào history TRƯỚC khi update
     boardHistoryRef.current = [...boardHistoryRef.current, board];
-    
-    // Giới hạn history để tránh memory leak (giữ 10 board gần nhất)
-    if (boardHistoryRef.current.length > 10) {
-      boardHistoryRef.current = boardHistoryRef.current.slice(-10);
-    }
+    koHistoryRef.current = result.captures === 1 ? board : null;
     
     setBoard(result.board);
     setLastMove(position);
@@ -325,7 +308,6 @@ const GoGame: React.FC = () => {
     const newHistory = moveHistory.slice(0, -actualMovesToUndo);
     setMoveHistory(newHistory);
     
-    // Lấy board từ history
     const previousBoard = boardHistoryRef.current[boardHistoryRef.current.length - actualMovesToUndo] || 
                          makeEmptyBoard(settings.boardSize);
     setBoard(previousBoard);
@@ -343,11 +325,12 @@ const GoGame: React.FC = () => {
     
     setCurrentPlayer(newHistory.length > 0 ? 
       (newHistory[newHistory.length - 1].player === Stone.BLACK ? Stone.WHITE : Stone.BLACK) : 
-      (settings.handicap > 0 ? Stone.WHITE : Stone.BLACK));
+      Stone.BLACK);
     
     setPassCount(newHistory.slice(-2).filter(m => m.isPass).length);
     setGameStatus('playing');
     setShowScore(false);
+    koHistoryRef.current = null;
     boardHistoryRef.current = boardHistoryRef.current.slice(0, -actualMovesToUndo);
     
     setTimerExpiry(() => {
@@ -355,7 +338,7 @@ const GoGame: React.FC = () => {
       now.setSeconds(now.getSeconds() + settings.timePerMove);
       return now;
     });
-  }, [moveHistory, gameMode, settings.boardSize, settings.timePerMove, settings.handicap]);
+  }, [moveHistory, gameMode, settings.boardSize, settings.timePerMove]);
 
   const saveGame = useCallback(() => {
     try {
@@ -393,8 +376,8 @@ const GoGame: React.FC = () => {
         const newBoard = makeEmptyBoard(gameData.boardSize);
         let currentBoard = newBoard;
         let currentCaptures = { black: 0, white: 0 };
+        let koBoard: StoneType[][] | null = null;
         const newMoveHistory: GameMove[] = [];
-        boardHistoryRef.current = [];
         
         for (const move of gameData.moves) {
           if (move.position.x === -1 && move.position.y === -1) {
@@ -408,14 +391,14 @@ const GoGame: React.FC = () => {
             };
             newMoveHistory.push(passMove);
           } else {
-            const result = tryPlay(currentBoard, move.position.x, move.position.y, move.player, boardHistoryRef.current);
+            const result = tryPlay(currentBoard, move.position.x, move.position.y, move.player, koBoard);
             if (!result.legal || !result.board) continue;
             
-            boardHistoryRef.current.push(currentBoard);
             currentBoard = result.board;
             if (result.captures && result.captures > 0) {
               currentCaptures[move.player === Stone.BLACK ? 'black' : 'white'] += result.captures;
             }
+            koBoard = result.captures === 1 ? currentBoard : null;
             
             const gameMove: GameMove = {
               player: move.player,
@@ -425,6 +408,7 @@ const GoGame: React.FC = () => {
               boardState: produce(currentBoard, draft => draft)
             };
             newMoveHistory.push(gameMove);
+            boardHistoryRef.current.push(currentBoard);
           }
         }
         
@@ -440,6 +424,7 @@ const GoGame: React.FC = () => {
         setPassCount(newMoveHistory.slice(-2).filter(m => m.isPass).length);
         setGameStatus('playing');
         setShowScore(false);
+        koHistoryRef.current = koBoard;
         
         event.target.value = '';
       } catch (error) {
@@ -451,6 +436,23 @@ const GoGame: React.FC = () => {
     reader.onerror = () => alert('Lỗi khi đọc file. Vui lòng thử lại.');
     reader.readAsText(file);
   }, []);
+
+  // Fix: Reset game when board size changes
+  useEffect(() => {
+    const newBoard = makeEmptyBoard(settings.boardSize);
+    setBoard(newBoard);
+    setCurrentPlayer(Stone.BLACK);
+    setCaptures({ black: 0, white: 0 });
+    setMoveHistory([]);
+    setGameStatus('playing');
+    setPassCount(0);
+    setLastMove(null);
+    setShowScore(false);
+    setGameScore(null);
+    setAnimatingCaptures([]);
+    koHistoryRef.current = null;
+    boardHistoryRef.current = [];
+  }, [settings.boardSize]);
 
   useEffect(() => {
     initializeGame();
@@ -477,41 +479,50 @@ const GoGame: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyPress);
   }, [handlePass, handleUndo]);
 
+  // ========== RENDER BOARD (FIXED VERSION) ==========
   const renderBoard = useMemo(() => {
     const size = settings.boardSize;
     const windowWidth = typeof window !== 'undefined' ? window.innerWidth : 800;
-    const maxDisplaySize = Math.min(
-      windowWidth - 40, 
-      size <= 9 ? 400 : size <= 13 ? 500 : 600
-    );
-    const cellSize = maxDisplaySize / (size - 1);
+    const windowHeight = typeof window !== 'undefined' ? window.innerHeight : 600;
+    
+    const maxWidth = Math.min(windowWidth - 40, 600);
+    const maxHeight = Math.min(windowHeight - 200, 600);
+    const maxDisplaySize = Math.min(maxWidth, maxHeight);
+    
+    const baseCellSize = maxDisplaySize / (size - 1);
+    const cellSize = Math.max(baseCellSize, 20);
+    const actualDisplaySize = cellSize * (size - 1);
     const padding = cellSize / 2;
+    
     const starPoints = generateStarPoints(size);
 
     return (
       <div
         className="relative rounded-xl shadow-2xl mx-auto transform transition-transform duration-300 hover:scale-[1.01]"
         style={{
-          width: maxDisplaySize + padding * 2,
-          height: maxDisplaySize + padding * 2,
+          width: actualDisplaySize + padding * 2,
+          height: actualDisplaySize + padding * 2,
           background: 'linear-gradient(135deg, #d2b48c 0%, #e6c088 50%, #d2b48c 100%)',
           padding,
           boxShadow: '0 8px 24px rgba(0,0,0,0.3)',
+          touchAction: 'none',
+          userSelect: 'none',
+          WebkitUserSelect: 'none',
         }}
       >
         <svg
           className="absolute inset-0 pointer-events-none"
-          style={{ width: maxDisplaySize + padding * 2, height: maxDisplaySize + padding * 2 }}
+          style={{ width: actualDisplaySize + padding * 2, height: actualDisplaySize + padding * 2 }}
         >
           {Array.from({ length: size }).map((_, index) => (
             <line
               key={`h-${index}`}
               x1={padding}
               y1={padding + index * cellSize}
-              x2={padding + maxDisplaySize}
+              x2={padding + actualDisplaySize}
               y2={padding + index * cellSize}
               stroke="#5c4033"
-              strokeWidth="1.5"
+              strokeWidth={size <= 9 ? "1" : "1.5"}
               opacity="0.9"
             />
           ))}
@@ -521,9 +532,9 @@ const GoGame: React.FC = () => {
               x1={padding + index * cellSize}
               y1={padding}
               x2={padding + index * cellSize}
-              y2={padding + maxDisplaySize}
+              y2={padding + actualDisplaySize}
               stroke="#5c4033"
-              strokeWidth="1.5"
+              strokeWidth={size <= 9 ? "1" : "1.5"}
               opacity="0.9"
             />
           ))}
@@ -532,37 +543,84 @@ const GoGame: React.FC = () => {
               key={`star-${index}`}
               cx={padding + point.x * cellSize}
               cy={padding + point.y * cellSize}
-              r={size >= 19 ? 4 : size >= 13 ? 3 : 2.5}
+              r={Math.max(cellSize * 0.1, 2)}
               fill="#5c4033"
             />
           ))}
         </svg>
         
-        {board.map((row, y) =>
-          row.map((stone, x) => {
-            const isLastMovePosition = lastMove?.x === x && lastMove?.y === y;
-            const isAnimating = animatingCaptures.some(pos => pos.x === x && pos.y === y);
-            const isHovered = hoverPosition?.x === x && hoverPosition?.y === y;
-            
-            return (
-              <BoardCell
-                key={`cell-${x}-${y}`}
-                position={{ x, y }}
-                stone={stone}
-                cellSize={cellSize}
-                isValidMove={isValidMove({ x, y })}
-                isLastMove={isLastMovePosition}
-                onHover={setHoverPosition}
-                onClick={handlePlaceStone}
-                isAnimating={isAnimating}
-                showTooltip={isHovered}
-              />
-            );
-          })
-        )}
+        <div 
+          className="absolute inset-0"
+          style={{ 
+            padding,
+            pointerEvents: 'none' 
+          }}
+        >
+          {board.map((row, y) =>
+            row.map((stone, x) => {
+              const isLastMovePosition = lastMove?.x === x && lastMove?.y === y;
+              const isAnimating = animatingCaptures.some(pos => pos.x === x && pos.y === y);
+              const isHovered = hoverPosition?.x === x && hoverPosition?.y === y;
+              
+              return (
+                <div
+                  key={`cell-${x}-${y}`}
+                  style={{
+                    position: 'absolute',
+                    left: x * cellSize - cellSize / 2,
+                    top: y * cellSize - cellSize / 2,
+                    width: cellSize,
+                    height: cellSize,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    cursor: isValidMove({ x, y }) ? 'pointer' : 'default',
+                    pointerEvents: 'auto',
+                    zIndex: stone !== Stone.EMPTY ? 20 : 10,
+                  }}
+                  onMouseEnter={() => setHoverPosition({ x, y })}
+                  onMouseLeave={() => setHoverPosition(null)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (isValidMove({ x, y })) {
+                      handlePlaceStone({ x, y });
+                    }
+                  }}
+                  onTouchEnd={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (isValidMove({ x, y })) {
+                      handlePlaceStone({ x, y });
+                    }
+                  }}
+                >
+                  {stone !== Stone.EMPTY && (
+                    <StoneComponent
+                      stone={stone}
+                      size={cellSize < 30 ? 'small' : cellSize < 40 ? 'medium' : 'large'}
+                      isLastMove={isLastMovePosition}
+                      isAnimating={isAnimating}
+                    />
+                  )}
+                  {isValidMove({ x, y }) && isHovered && stone === Stone.EMPTY && (
+                    <div 
+                      className="absolute rounded-full pointer-events-none"
+                      style={{
+                        width: cellSize * 0.8,
+                        height: cellSize * 0.8,
+                        backgroundColor: currentPlayer === Stone.BLACK ? 'rgba(0,0,0,0.2)' : 'rgba(255,255,255,0.3)',
+                        border: '1px solid rgba(0,0,0,0.1)',
+                      }}
+                    />
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
         
         {isLoadingAI && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-20 rounded-xl">
+          <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-20 rounded-xl z-50">
             <div className="bg-white px-4 py-2 rounded-lg shadow-lg animate-pulse flex items-center gap-2">
               <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
               <span className="text-sm font-medium text-gray-800">AI đang tính toán...</span>
@@ -572,289 +630,240 @@ const GoGame: React.FC = () => {
       </div>
     );
   }, [
-    board, settings.boardSize, hoverPosition, lastMove,
-    isValidMove, handlePlaceStone, isLoadingAI, animatingCaptures
+    board, 
+    settings.boardSize, 
+    hoverPosition, 
+    lastMove,
+    isValidMove, 
+    handlePlaceStone, 
+    isLoadingAI, 
+    animatingCaptures,
+    currentPlayer
   ]);
 
+  // ========== PHẦN UI MỚI - PREMIUM DESIGN ==========
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-100 via-gray-200 to-gray-300 py-4 sm:py-8 px-2 sm:px-6">
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900">
+      {/* Background Pattern */}
+      <div className="fixed inset-0 opacity-20">
+        <div className="absolute inset-0" style={{
+          backgroundImage: `url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%239C92AC' fill-opacity='0.1'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E")`,
+        }} />
+      </div>
+
       <style>
         {`
+          @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+          }
+          @keyframes glow {
+            0%, 100% { box-shadow: 0 0 20px rgba(168, 85, 247, 0.5); }
+            50% { box-shadow: 0 0 30px rgba(168, 85, 247, 0.8); }
+          }
+          @keyframes slideIn {
+            from { opacity: 0; transform: translateX(-20px); }
+            to { opacity: 1; transform: translateX(0); }
+          }
+          .float-animation { animation: float 3s ease-in-out infinite; }
+          .glow-animation { animation: glow 2s ease-in-out infinite; }
+          .slide-in { animation: slideIn 0.3s ease-out; }
+          .glass-effect {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+          }
+          .neo-shadow {
+            box-shadow: 
+              0 10px 40px rgba(0, 0, 0, 0.3),
+              inset 0 1px 0 rgba(255, 255, 255, 0.2);
+          }
           @keyframes place-stone {
             0% { transform: scale(0.5); opacity: 0.5; }
             50% { transform: scale(1.2); opacity: 1; }
             100% { transform: scale(1); opacity: 1; }
           }
-          .animate-place-stone {
-            animation: place-stone 0.3s ease-out;
-          }
+          .animate-place-stone { animation: place-stone 0.3s ease-out; }
           .shadow-stone-black {
-            box-shadow: 2px 2px 6px rgba(0,0,0,0.5), inset -1px -1px 2px rgba(255,255,255,0.2);
+            box-shadow: 
+              2px 2px 6px rgba(0,0,0,0.7), 
+              inset -2px -2px 4px rgba(255,255,255,0.1),
+              0 0 10px rgba(0,0,0,0.3);
           }
           .shadow-stone-white {
-            box-shadow: 2px 2px 6px rgba(0,0,0,0.3), inset -1px -1px 2px rgba(0,0,0,0.1);
+            box-shadow: 
+              2px 2px 6px rgba(0,0,0,0.4), 
+              inset -2px -2px 4px rgba(0,0,0,0.1),
+              0 0 10px rgba(255,255,255,0.5);
           }
         `}
       </style>
-      
-      <div className="max-w-7xl mx-auto">
-        {/* Header */}
-        <div className="bg-gradient-to-r from-gray-900 via-gray-800 to-gray-900 text-white p-4 sm:p-6 rounded-t-2xl shadow-xl">
-          <div className="flex flex-col sm:flex-row justify-between items-center gap-3 sm:gap-4">
-            <h1 className="text-xl sm:text-3xl font-extrabold tracking-tight">⚫⚪ Cờ Vây Pro</h1>
-            <div className="flex items-center space-x-3 sm:space-x-4">
-              <span className="flex items-center gap-2">
-                <div className={`w-6 h-6 sm:w-8 sm:h-8 rounded-full transition-all duration-300 ${
-                  currentPlayer === Stone.BLACK
-                    ? 'bg-gradient-to-br from-gray-800 to-black shadow-stone-black'
-                    : 'bg-gradient-to-br from-white to-gray-200 shadow-stone-white'
-                }`} />
-                <span className="text-sm sm:text-lg font-medium">
-                  Lượt: {currentPlayer === Stone.BLACK ? 'Đen' : 'Trắng'}
-                </span>
-              </span>
+
+      <div className="relative z-10 max-w-8xl mx-auto p-4 sm:p-6">
+        {/* Premium Header */}
+        <header className="glass-effect rounded-2xl p-4 sm:p-6 mb-6 neo-shadow">
+          <div className="flex flex-col lg:flex-row justify-between items-center gap-4">
+            <div className="flex items-center gap-4">
+              <div className="relative">
+                <div className="w-12 h-12 sm:w-16 sm:h-16 rounded-xl bg-gradient-to-br from-purple-600 to-pink-600 flex items-center justify-center glow-animation">
+                  <span className="text-2xl sm:text-3xl">♟️</span>
+                </div>
+                <div className="absolute -top-1 -right-1 w-3 h-3 bg-green-400 rounded-full animate-pulse" />
+              </div>
+              <div>
+                <h1 className="text-2xl sm:text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-purple-400 to-pink-400">
+                  Go Master Pro
+                </h1>
+                <p className="text-xs sm:text-sm text-gray-400">Professional Go Game Experience</p>
+              </div>
+            </div>
+
+            {/* Game Status Bar */}
+            <div className="flex items-center gap-3 sm:gap-6">
+              <div className="flex items-center gap-3 glass-effect rounded-xl px-4 py-2">
+                <div className="flex items-center gap-2">
+                  <div className={`w-8 h-8 rounded-full float-animation ${
+                    currentPlayer === Stone.BLACK
+                      ? 'bg-gradient-to-br from-gray-800 to-black shadow-stone-black'
+                      : 'bg-gradient-to-br from-white to-gray-200 shadow-stone-white'
+                  }`} />
+                  <div className="text-white">
+                    <div className="text-xs text-gray-400">Current</div>
+                    <div className="font-bold">{currentPlayer === Stone.BLACK ? 'Black' : 'White'}</div>
+                  </div>
+                </div>
+                <div className="w-px h-8 bg-gray-600" />
+                <div className="text-white">
+                  <div className="text-xs text-gray-400">Move</div>
+                  <div className="font-bold">#{moveHistory.length}</div>
+                </div>
+              </div>
+
+              {/* Timer with modern design */}
+              <div className={`glass-effect rounded-xl px-4 py-2 ${
+                isTimerActive ? 'border-red-500' : 'border-gray-500'
+              }`}>
+                <TimerDisplay
+                  expiryTimestamp={timerExpiry}
+                  onExpire={() => {
+                    handlePass();
+                    alert(`${currentPlayer === Stone.BLACK ? 'Black' : 'White'} timeout!`);
+                  }}
+                  isActive={isTimerActive && gameStatus === 'playing'}
+                  color={currentPlayer === Stone.BLACK ? 'black' : 'white'}
+                />
+              </div>
+
               <button
                 onClick={() => setShowTutorial(true)}
-                className="p-2 bg-blue-600 rounded-full hover:bg-blue-700 transition-colors duration-200 shadow-md"
-                aria-label="Hướng dẫn"
+                className="p-3 glass-effect rounded-xl hover:bg-white/20 transition-all duration-200 group"
+                aria-label="Tutorial"
               >
-                <svg className="w-4 h-4 sm:w-5 sm:h-5" fill="white" viewBox="0 0 24 24">
+                <svg className="w-5 h-5 text-purple-400 group-hover:text-purple-300" fill="currentColor" viewBox="0 0 24 24">
                   <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75l-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H8c0-2.21 1.79-4 4-4s4 1.79 4 4c0 .88-.36 1.68-.93 2.25z"/>
                 </svg>
               </button>
             </div>
           </div>
-        </div>
-        
-        {/* Main Content */}
-        <div className="bg-white rounded-b-2xl shadow-xl p-4 sm:p-8">
-          {/* Game Mode Selection */}
-          <div className="mb-4 sm:mb-6 flex flex-col sm:flex-row justify-center gap-2 sm:gap-4">
-            <button
-              onClick={() => setGameMode('local')}
-              className={`px-4 sm:px-6 py-2 sm:py-3 rounded-lg font-semibold text-sm sm:text-base transition-all duration-200 shadow-md ${
-                gameMode === 'local'
-                  ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white transform scale-105'
-                  : 'bg-gray-200 hover:bg-gray-300 text-gray-800'
-              }`}
-            >
-              👥 Chơi 2 người
-            </button>
-            <button
-              onClick={() => setGameMode('ai')}
-              className={`px-4 sm:px-6 py-2 sm:py-3 rounded-lg font-semibold text-sm sm:text-base transition-all duration-200 shadow-md ${
-                gameMode === 'ai'
-                  ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white transform scale-105'
-                  : 'bg-gray-200 hover:bg-gray-300 text-gray-800'
-              }`}
-            >
-              🤖 Chơi với AI
-            </button>
-          </div>
-          
-          <div className="flex flex-col lg:flex-row gap-4 sm:gap-8">
-            {/* Sidebar */}
-            <div className="lg:w-80 space-y-4 sm:space-y-6 order-2 lg:order-1">
-              {/* Game Info */}
-              <div className="bg-gradient-to-br from-gray-50 to-gray-100 p-4 sm:p-6 rounded-xl border border-gray-200 shadow-lg">
-                <h3 className="font-bold text-base sm:text-lg mb-3 text-gray-800">📊 Thông tin ván cờ</h3>
-                <div className="space-y-2 text-sm sm:text-base">
-                  <div className="flex justify-between">
-                    <span className="text-gray-600">Quân bắt được:</span>
-                    <span className="font-medium">⚫ {captures.black} | ⚪ {captures.white}</span>
+        </header>
+
+        {/* Main Game Area */}
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+          {/* Left Sidebar - Game Controls */}
+          <div className="xl:col-span-3 space-y-4 order-2 xl:order-1">
+            {/* Game Mode Selector */}
+            <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
+              <h3 className="text-white font-bold mb-3 flex items-center gap-2">
+                <span className="text-xl">🎮</span> Game Mode
+              </h3>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => setGameMode('local')}
+                  className={`py-3 px-4 rounded-xl font-semibold transition-all duration-200 ${
+                    gameMode === 'local'
+                      ? 'bg-gradient-to-r from-purple-600 to-pink-600 text-white neo-shadow transform scale-105'
+                      : 'glass-effect text-gray-300 hover:bg-white/20'
+                  }`}
+                >
+                  <span className="block text-lg mb-1">👥</span>
+                  <span className="text-xs">Local</span>
+                </button>
+                <button
+                  onClick={() => setGameMode('ai')}
+                  className={`py-3 px-4 rounded-xl font-semibold transition-all duration-200 ${
+                    gameMode === 'ai'
+                      ? 'bg-gradient-to-r from-purple-600 to-pink-600 text-white neo-shadow transform scale-105'
+                      : 'glass-effect text-gray-300 hover:bg-white/20'
+                  }`}
+                >
+                  <span className="block text-lg mb-1">🤖</span>
+                  <span className="text-xs">vs AI</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Statistics */}
+            <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
+              <h3 className="text-white font-bold mb-3 flex items-center gap-2">
+                <span className="text-xl">📊</span> Statistics
+              </h3>
+              <div className="space-y-3">
+                <div className="flex justify-between items-center">
+                  <span className="text-gray-400 text-sm">Captured</span>
+                  <div className="flex gap-3">
+                    <span className="text-white font-mono">⚫ {captures.black}</span>
+                    <span className="text-white font-mono">⚪ {captures.white}</span>
                   </div>
-                  <div className="flex justify-between">
-                    <span className="text-gray-600">Komi:</span>
-                    <span className="font-medium">{settings.komi}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-gray-600">Số nước:</span>
-                    <span className="font-medium">{moveHistory.length}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-gray-600">Pass liên tiếp:</span>
-                    <span className="font-medium">{passCount}/2</span>
-                  </div>
-                  {settings.handicap > 0 && (
-                    <div className="flex justify-between">
-                      <span className="text-gray-600">Quân chấp:</span>
-                      <span className="font-medium">{settings.handicap} quân</span>
-                    </div>
-                  )}
-                  <TimerDisplay
-                    expiryTimestamp={timerExpiry}
-                    onExpire={() => {
-                      handlePass();
-                      alert(`${currentPlayer === Stone.BLACK ? 'Đen' : 'Trắng'} hết thời gian và pass.`);
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-gray-400 text-sm">Territory</span>
+                  <button 
+                    onClick={() => {
+                      const score = calculateScore();
+                      setGameScore(score);
+                      setShowScore(true);
                     }}
-                    isActive={isTimerActive && gameStatus === 'playing'}
-                    color={currentPlayer === Stone.BLACK ? 'black' : 'white'}
-                  />
-                </div>
-              </div>
-              
-              {/* Settings */}
-              <div className="bg-gradient-to-br from-blue-50 to-blue-100 p-4 sm:p-6 rounded-xl border border-blue-200 shadow-lg">
-                <h3 className="font-bold text-base sm:text-lg mb-3 text-gray-800">⚙️ Cài đặt</h3>
-                <div className="space-y-3">
-                  <div>
-                    <label className="block text-sm sm:text-base font-medium mb-1 text-gray-700">
-                      Kích thước bàn cờ:
-                    </label>
-                    <select
-                      value={settings.boardSize}
-                      onChange={(e) => setSettings(prev => ({ ...prev, boardSize: Number(e.target.value) }))}
-                      className="w-full p-2 text-sm sm:text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all"
-                    >
-                      {BOARD_SIZES.map(size => (
-                        <option key={size} value={size}>{size}x{size}</option>
-                      ))}
-                    </select>
-                  </div>
-                  
-                  <div>
-                    <label className="block text-sm sm:text-base font-medium mb-1 text-gray-700">
-                      Quân chấp (Handicap):
-                    </label>
-                    <select
-                      value={settings.handicap}
-                      onChange={(e) => setSettings(prev => ({ ...prev, handicap: Number(e.target.value) }))}
-                      className="w-full p-2 text-sm sm:text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all"
-                      disabled={gameMode === 'ai'} // AI chưa hỗ trợ handicap
-                    >
-                      <option value="0">Không chấp</option>
-                      <option value="2">2 quân</option>
-                      <option value="3">3 quân</option>
-                      <option value="4">4 quân</option>
-                      <option value="5">5 quân</option>
-                      <option value="6">6 quân</option>
-                      <option value="7">7 quân</option>
-                      <option value="8">8 quân</option>
-                      <option value="9">9 quân</option>
-                    </select>
-                    {gameMode === 'ai' && settings.handicap > 0 && (
-                      <p className="text-xs text-red-500 mt-1">
-                        AI chưa hỗ trợ chơi với handicap
-                      </p>
-                    )}
-                  </div>
-                  
-                  <div>
-                    <label className="block text-sm sm:text-base font-medium mb-1 text-gray-700">
-                      Thời gian mỗi nước (giây):
-                    </label>
-                    <input
-                      type="number"
-                      value={settings.timePerMove}
-                      onChange={(e) => setSettings(prev => ({ ...prev, timePerMove: Number(e.target.value) }))}
-                      min="10"
-                      max="300"
-                      className="w-full p-2 text-sm sm:text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all"
-                    />
-                  </div>
-                  
-                  {gameMode === 'ai' && (
-                    <>
-                      <div>
-                        <label className="block text-sm sm:text-base font-medium mb-1 text-gray-700">
-                          Bạn chơi quân:
-                        </label>
-                        <div className="flex space-x-2">
-                          <button
-                            onClick={() => setSettings(prev => ({ ...prev, humanColor: 'black' }))}
-                            className={`flex-1 py-2 px-3 text-sm sm:text-base rounded-lg font-medium transition-all duration-200 ${
-                              settings.humanColor === 'black'
-                                ? 'bg-gradient-to-r from-gray-800 to-black text-white shadow-md'
-                                : 'bg-gray-200 hover:bg-gray-300 text-gray-800'
-                            }`}
-                          >
-                            ⚫ Đen
-                          </button>
-                          <button
-                            onClick={() => setSettings(prev => ({ ...prev, humanColor: 'white' }))}
-                            className={`flex-1 py-2 px-3 text-sm sm:text-base rounded-lg font-medium transition-all duration-200 ${
-                              settings.humanColor === 'white'
-                                ? 'bg-gradient-to-r from-gray-100 to-white text-black border-2 border-gray-800 shadow-md'
-                                : 'bg-gray-200 hover:bg-gray-300 text-gray-800'
-                            }`}
-                          >
-                            ⚪ Trắng
-                          </button>
-                        </div>
-                      </div>
-                      
-                      <div>
-                        <label className="block text-sm sm:text-base font-medium mb-1 text-gray-700">
-                          Độ khó AI:
-                        </label>
-                        <select
-                          value={settings.difficulty}
-                          onChange={(e) => setSettings(prev => ({ 
-                            ...prev, 
-                            difficulty: e.target.value as 'easy' | 'medium' | 'hard' 
-                          }))}
-                          className="w-full p-2 text-sm sm:text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all"
-                        >
-                          <option value="easy">🟢 Dễ</option>
-                          <option value="medium">🟡 Trung bình</option>
-                          <option value="hard">🔴 Khó (MCTS)</option>
-                        </select>
-                      </div>
-                    </>
-                  )}
-                </div>
-              </div>
-              
-              {/* Save/Load */}
-              <div className="bg-gradient-to-br from-purple-50 to-purple-100 p-4 sm:p-6 rounded-xl border border-purple-200 shadow-lg">
-                <h3 className="font-bold text-base sm:text-lg mb-3 text-gray-800">💾 Lưu/Tải</h3>
-                <div className="space-y-3">
-                  <button
-                    onClick={saveGame}
-                    className="w-full py-2 px-3 bg-gradient-to-r from-purple-600 to-purple-700 text-white text-sm sm:text-base rounded-lg hover:from-purple-700 hover:to-purple-800 transition-all duration-200 shadow-md transform hover:scale-105"
+                    className="text-purple-400 hover:text-purple-300 text-sm font-medium"
                   >
-                    💾 Lưu ván cờ (SGF)
+                    Calculate →
                   </button>
-                  <label className="block">
-                    <span className="sr-only">Tải ván cờ</span>
-                    <input
-                      type="file"
-                      accept=".sgf"
-                      onChange={loadGame}
-                      className="block w-full text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-purple-100 file:text-purple-700 hover:file:bg-purple-200 transition-all"
-                    />
-                  </label>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-gray-400 text-sm">Komi</span>
+                  <span className="text-white font-mono">{settings.komi}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-gray-400 text-sm">Pass Count</span>
+                  <span className="text-white font-mono">{passCount}/2</span>
                 </div>
               </div>
             </div>
-            
-            {/* Board Area */}
-            <div className="flex-1 order-1 lg:order-2">
-              <div className="flex justify-center mb-4 sm:mb-6">
-                {renderBoard}
-              </div>
-              
-              {/* Control Buttons */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3 mb-4 sm:mb-6">
+
+            {/* Quick Actions */}
+            <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
+              <h3 className="text-white font-bold mb-3 flex items-center gap-2">
+                <span className="text-xl">⚡</span> Quick Actions
+              </h3>
+              <div className="grid grid-cols-2 gap-2">
                 <button
                   onClick={handlePass}
                   disabled={gameStatus !== 'playing'}
-                  className="px-3 sm:px-6 py-2 sm:py-3 text-sm sm:text-base bg-gradient-to-r from-yellow-500 to-yellow-600 text-white rounded-lg hover:from-yellow-600 hover:to-yellow-700 disabled:from-gray-300 disabled:to-gray-400 shadow-md transition-all duration-200 transform hover:scale-105"
+                  className="py-2 px-3 rounded-xl bg-gradient-to-r from-yellow-600 to-orange-600 text-white font-medium hover:from-yellow-700 hover:to-orange-700 disabled:from-gray-600 disabled:to-gray-700 transition-all duration-200 neo-shadow"
                 >
-                  Pass (P)
+                  Pass
                 </button>
                 <button
                   onClick={handleUndo}
                   disabled={moveHistory.length === 0}
-                  className="px-3 sm:px-6 py-2 sm:py-3 text-sm sm:text-base bg-gradient-to-r from-blue-500 to-blue-600 text-white rounded-lg hover:from-blue-600 hover:to-blue-700 disabled:from-gray-300 disabled:to-gray-400 shadow-md transition-all duration-200 transform hover:scale-105"
+                  className="py-2 px-3 rounded-xl bg-gradient-to-r from-blue-600 to-cyan-600 text-white font-medium hover:from-blue-700 hover:to-cyan-700 disabled:from-gray-600 disabled:to-gray-700 transition-all duration-200 neo-shadow"
                 >
-                  ↶ Hoàn tác
+                  Undo
                 </button>
                 <button
                   onClick={initializeGame}
-                  className="px-3 sm:px-6 py-2 sm:py-3 text-sm sm:text-base bg-gradient-to-r from-red-500 to-red-600 text-white rounded-lg hover:from-red-600 hover:to-red-700 shadow-md transition-all duration-200 transform hover:scale-105"
+                  className="py-2 px-3 rounded-xl bg-gradient-to-r from-red-600 to-pink-600 text-white font-medium hover:from-red-700 hover:to-pink-700 transition-all duration-200 neo-shadow"
                 >
-                  🔄 Chơi lại
+                  Reset
                 </button>
                 <button
                   onClick={() => {
@@ -863,32 +872,203 @@ const GoGame: React.FC = () => {
                     setShowScore(true);
                     setIsTimerActive(false);
                   }}
-                  className="px-3 sm:px-6 py-2 sm:py-3 text-sm sm:text-base bg-gradient-to-r from-green-500 to-green-600 text-white rounded-lg hover:from-green-600 hover:to-green-700 shadow-md transition-all duration-200 transform hover:scale-105"
+                  className="py-2 px-3 rounded-xl bg-gradient-to-r from-green-600 to-emerald-600 text-white font-medium hover:from-green-700 hover:to-emerald-700 transition-all duration-200 neo-shadow"
                 >
-                  📊 Tính điểm
+                  Score
                 </button>
               </div>
             </div>
           </div>
+
+          {/* Center - Game Board */}
+          <div className="xl:col-span-6 order-1 xl:order-2">
+            <div className="glass-effect rounded-2xl p-4 sm:p-6 neo-shadow">
+              <div className="flex justify-center">
+                {renderBoard}
+              </div>
+            </div>
+          </div>
+
+          {/* Right Sidebar - Settings */}
+          <div className="xl:col-span-3 space-y-4 order-3">
+            {/* Settings Panel */}
+            <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
+              <h3 className="text-white font-bold mb-3 flex items-center gap-2">
+                <span className="text-xl">⚙️</span> Settings
+              </h3>
+              <div className="space-y-4">
+                <div>
+                  <label className="text-gray-400 text-sm block mb-2">Board Size</label>
+                  <select
+                    value={settings.boardSize}
+                    onChange={(e) => setSettings(prev => ({ ...prev, boardSize: Number(e.target.value) }))}
+                    className="w-full px-3 py-2 rounded-xl bg-white/10 border border-white/20 text-white focus:border-purple-400 focus:outline-none transition-colors"
+                  >
+                    {BOARD_SIZES.map(size => (
+                      <option key={size} value={size} className="bg-gray-800">
+                        {size}×{size}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {gameMode === 'ai' && (
+                  <>
+                    <div>
+                      <label className="text-gray-400 text-sm block mb-2">AI Difficulty</label>
+                      <div className="grid grid-cols-3 gap-1">
+                        {(['easy', 'medium', 'hard'] as const).map(level => (
+                          <button
+                            key={level}
+                            onClick={() => setSettings(prev => ({ ...prev, difficulty: level }))}
+                            className={`py-2 px-2 rounded-lg text-xs font-medium transition-all ${
+                              settings.difficulty === level
+                                ? 'bg-gradient-to-r from-purple-600 to-pink-600 text-white'
+                                : 'glass-effect text-gray-300 hover:bg-white/20'
+                            }`}
+                          >
+                            {level === 'easy' ? '🟢 Easy' : level === 'medium' ? '🟡 Med' : '🔴 Hard'}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="text-gray-400 text-sm block mb-2">Play as</label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          onClick={() => setSettings(prev => ({ ...prev, humanColor: 'black' }))}
+                          className={`py-2 px-3 rounded-xl font-medium transition-all ${
+                            settings.humanColor === 'black'
+                              ? 'bg-gradient-to-r from-gray-800 to-black text-white'
+                              : 'glass-effect text-gray-300 hover:bg-white/20'
+                          }`}
+                        >
+                          ⚫ Black
+                        </button>
+                        <button
+                          onClick={() => setSettings(prev => ({ ...prev, humanColor: 'white' }))}
+                          className={`py-2 px-3 rounded-xl font-medium transition-all ${
+                            settings.humanColor === 'white'
+                              ? 'bg-gradient-to-r from-gray-100 to-white text-black'
+                              : 'glass-effect text-gray-300 hover:bg-white/20'
+                          }`}
+                        >
+                          ⚪ White
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                <div>
+                  <label className="text-gray-400 text-sm block mb-2">
+                    Time per Move
+                  </label>
+                  <input
+                    type="range"
+                    min="10"
+                    max="300"
+                    value={settings.timePerMove}
+                    onChange={(e) => setSettings(prev => ({ ...prev, timePerMove: Number(e.target.value) }))}
+                    className="w-full"
+                  />
+                  <div className="text-white text-center text-sm mt-1">
+                    {settings.timePerMove}s
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Save/Load Panel */}
+            <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
+              <h3 className="text-white font-bold mb-3 flex items-center gap-2">
+                <span className="text-xl">💾</span> Game Data
+              </h3>
+              <div className="space-y-2">
+                <button
+                  onClick={saveGame}
+                  className="w-full py-2 px-3 rounded-xl bg-gradient-to-r from-purple-600 to-violet-600 text-white font-medium hover:from-purple-700 hover:to-violet-700 transition-all duration-200 neo-shadow flex items-center justify-center gap-2"
+                >
+                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                    <path d="M7 9a2 2 0 012-2h6a2 2 0 012 2v6a2 2 0 01-2 2H9a2 2 0 01-2-2V9z"/>
+                    <path d="M5 3a2 2 0 00-2 2v6a2 2 0 002 2V5h8a2 2 0 00-2-2H5z"/>
+                  </svg>
+                  Export SGF
+                </button>
+                <label className="block">
+                  <input
+                    type="file"
+                    accept=".sgf"
+                    onChange={loadGame}
+                    className="hidden"
+                  />
+                  <div className="w-full py-2 px-3 rounded-xl glass-effect text-gray-300 font-medium hover:bg-white/20 transition-all duration-200 cursor-pointer flex items-center justify-center gap-2">
+                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                      <path d="M8 2a1 1 0 000 2h2a1 1 0 100-2H8z"/>
+                      <path d="M3 5a2 2 0 012-2 1 1 0 000 2H5v7h2l1 2h4l1-2h2V5h2a1 1 0 100-2 2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V5a2 2 0 00-2-2z"/>
+                    </svg>
+                    Import SGF
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            {/* Keyboard Shortcuts */}
+            <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
+              <h3 className="text-white font-bold mb-3 flex items-center gap-2">
+                <span className="text-xl">⌨️</span> Shortcuts
+              </h3>
+              <div className="space-y-2 text-sm">
+                {[
+                  { key: 'P', action: 'Pass' },
+                  { key: 'Ctrl+Z', action: 'Undo' },
+                  { key: 'T', action: 'Tutorial' },
+                  { key: 'N', action: 'New Game' },
+                ].map(({ key, action }) => (
+                  <div key={key} className="flex justify-between text-gray-400">
+                    <kbd className="px-2 py-1 rounded bg-white/10 text-white font-mono text-xs">
+                      {key}
+                    </kbd>
+                    <span>{action}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
-        
-        {/* Modals */}
-        <TutorialModal
-          isOpen={showTutorial}
-          onClose={() => setShowTutorial(false)}
-        />
-        
-        <ScoreModal
-          isOpen={showScore}
-          gameScore={gameScore}
-          captures={captures}
-          onClose={() => setShowScore(false)}
-          onNewGame={() => {
-            setShowScore(false);
-            initializeGame();
-          }}
-        />
+
+        {/* Bottom Status Bar */}
+        <div className="mt-6 glass-effect rounded-2xl p-3 neo-shadow">
+          <div className="flex flex-wrap justify-center gap-2 sm:gap-4 text-xs sm:text-sm">
+            <div className="flex items-center gap-2 text-gray-400">
+              <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
+              <span>Game Status: {gameStatus === 'playing' ? 'Active' : 'Finished'}</span>
+            </div>
+            <div className="text-gray-400">|</div>
+            <div className="text-gray-400">
+              Mode: {gameMode === 'ai' ? `AI (${settings.difficulty})` : 'Local PvP'}
+            </div>
+            <div className="text-gray-400">|</div>
+            <div className="text-gray-400">
+              Board: {settings.boardSize}×{settings.boardSize}
+            </div>
+          </div>
+        </div>
       </div>
+
+      {/* Modals */}
+      <TutorialModal isOpen={showTutorial} onClose={() => setShowTutorial(false)} />
+      <ScoreModal
+        isOpen={showScore}
+        gameScore={gameScore}
+        captures={captures}
+        onClose={() => setShowScore(false)}
+        onNewGame={() => {
+          setShowScore(false);
+          initializeGame();
+        }}
+      />
     </div>
   );
 };
