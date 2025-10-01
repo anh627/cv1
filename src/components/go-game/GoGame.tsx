@@ -1,62 +1,438 @@
-// src/components/go-game/components/GoGame.tsx
-
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { produce } from 'immer';
 
-// Import types và constants
-import { 
-  StoneType, Stone, GameMode, GameStatus, Position, 
-  GameMove, Captures, GameScore, GameSettings 
-} from '../types';
-import { DEFAULT_SETTINGS, BOARD_SIZES } from '../constants';
+// ==================== TYPES ====================
+const Stone = { EMPTY: 0, BLACK: 1, WHITE: 2 };
 
-// Import utils
-import { 
-  makeEmptyBoard, inBounds, tryPlay, generateStarPoints,
-  getGroupAndLiberties 
-} from '../utils/board';
-import { pickAiMove } from '../utils/ai';
-import { exportToSGF, importFromSGF } from '../utils/sgf';
+// ==================== CONSTANTS ====================
+const BOARD_SIZES = [9, 13, 19];
+const DEFAULT_SETTINGS = {
+  boardSize: 9,
+  komi: 6.5,
+  difficulty: 'medium',
+  timePerMove: 60,
+  humanColor: 'black'
+};
 
-// Import components
-import { StoneComponent } from './StoneComponent';
-import { BoardCell } from './BoardCell';
-import { TimerDisplay } from './TimerDisplay';
-import { TutorialModal } from './TutorialModal';
-import { ScoreModal } from './ScoreModal';
+const TUTORIAL_STEPS = [
+  {
+    title: 'Đặt quân',
+    text: 'Click vào giao điểm trống để đặt quân. Mỗi quân cần ít nhất 1 "khí" (ô trống kề bên) để tồn tại.',
+    tip: 'Với AI easy, hãy đặt quân ở góc bàn cờ để dễ dàng mở rộng lãnh thổ.'
+  },
+  {
+    title: 'Bắt quân',
+    text: 'Bắt quân đối thủ bằng cách bao vây và chặn hết tất cả "khí" của nhóm quân.',
+    tip: 'AI medium có thể phản công, hãy cẩn thận bảo vệ quân của mình!'
+  },
+  {
+    title: 'Luật Ko',
+    text: 'Không được đặt quân tạo ra trạng thái bàn cờ lặp lại ngay lập tức.',
+    tip: 'Hãy đi một nước khác trước khi quay lại lấy quân.'
+  },
+  {
+    title: 'Pass & Kết thúc',
+    text: 'Nhấn Pass khi không còn nước đi tốt. Hai lần pass liên tiếp sẽ kết thúc ván đấu.',
+    tip: 'Hãy chắc chắn bạn đã bảo vệ vùng đất của mình trước khi pass!'
+  },
+  {
+    title: 'Tính điểm',
+    text: 'Điểm = Vùng đất kiểm soát + Quân đối thủ bắt được + Komi (6.5 điểm cho trắng).',
+    tip: 'Tạo "mắt" (empty space bao quanh) để bảo vệ vùng đất không bị tấn công.'
+  }
+];
 
-const GoGame: React.FC = () => {
-  // ========== TẤT CẢ STATE VÀ LOGIC GỐC ==========
-  const [animatingCaptures, setAnimatingCaptures] = useState<Position[]>([]);
-  const [gameMode, setGameMode] = useState<GameMode>('local');
-  const [settings, setSettings] = useState<GameSettings>(DEFAULT_SETTINGS);
-  const [board, setBoard] = useState<StoneType[][]>(() => makeEmptyBoard(settings.boardSize));
-  const [currentPlayer, setCurrentPlayer] = useState<StoneType>(Stone.BLACK);
-  const [captures, setCaptures] = useState<Captures>({ black: 0, white: 0 });
-  const [moveHistory, setMoveHistory] = useState<GameMove[]>([]);
-  const [gameStatus, setGameStatus] = useState<GameStatus>('playing');
+// ==================== UTILITY FUNCTIONS ====================
+const makeEmptyBoard = (size) => 
+  Array.from({ length: size }, () => Array(size).fill(Stone.EMPTY));
+
+const copyBoard = (board) => board.map(row => [...row]);
+
+const inBounds = (x, y, size) => x >= 0 && y >= 0 && x < size && y < size;
+
+const getNeighbors = (x, y, size) =>
+  [[1,0],[-1,0],[0,1],[0,-1]]
+    .map(([dx,dy]) => ({x: x+dx, y: y+dy}))
+    .filter(pos => inBounds(pos.x, pos.y, size));
+
+const getGroupAndLiberties = (board, x, y) => {
+  const color = board[y][x];
+  if (color === Stone.EMPTY) return { group: [], liberties: new Set() };
+  
+  const visited = new Set();
+  const liberties = new Set();
+  const group = [];
+  const stack = [{x, y}];
+  visited.add(`${x},${y}`);
+  
+  while (stack.length > 0) {
+    const curr = stack.pop();
+    group.push(curr);
+    
+    for (const n of getNeighbors(curr.x, curr.y, board.length)) {
+      const nColor = board[n.y][n.x];
+      const key = `${n.x},${n.y}`;
+      if (nColor === Stone.EMPTY) {
+        liberties.add(key);
+      } else if (nColor === color && !visited.has(key)) {
+        visited.add(key);
+        stack.push(n);
+      }
+    }
+  }
+  
+  return { group, liberties };
+};
+
+const tryPlay = (board, x, y, color, koBoard) => {
+  if (!inBounds(x, y, board.length) || board[y][x] !== Stone.EMPTY) 
+    return { legal: false };
+  
+  const newBoard = copyBoard(board);
+  newBoard[y][x] = color;
+  
+  let totalCaptures = 0;
+  const capturedPositions = [];
+  const opponent = color === Stone.BLACK ? Stone.WHITE : Stone.BLACK;
+  
+  for (const n of getNeighbors(x, y, board.length)) {
+    if (newBoard[n.y][n.x] === opponent) {
+      const { group, liberties } = getGroupAndLiberties(newBoard, n.x, n.y);
+      if (liberties.size === 0) {
+        totalCaptures += group.length;
+        group.forEach(pos => {
+          newBoard[pos.y][pos.x] = Stone.EMPTY;
+          capturedPositions.push(pos);
+        });
+      }
+    }
+  }
+  
+  const { liberties } = getGroupAndLiberties(newBoard, x, y);
+  if (liberties.size === 0 && totalCaptures === 0) return { legal: false };
+  
+  if (koBoard) {
+    let isSame = true;
+    for (let i = 0; i < board.length && isSame; i++) {
+      for (let j = 0; j < board.length; j++) {
+        if (newBoard[i][j] !== koBoard[i][j]) {
+          isSame = false;
+          break;
+        }
+      }
+    }
+    if (isSame) return { legal: false };
+  }
+  
+  return { legal: true, board: newBoard, captures: totalCaptures, capturedPositions };
+};
+
+const generateStarPoints = (size) => {
+  const points = [];
+  const edge = size <= 9 ? 2 : 3;
+  const center = Math.floor(size / 2);
+  const far = size - edge - 1;
+  
+  if (size >= 9) {
+    points.push(
+      { x: edge, y: edge },
+      { x: edge, y: far },
+      { x: far, y: edge },
+      { x: far, y: far }
+    );
+  }
+  
+  if (size >= 13) {
+    points.push(
+      { x: edge, y: center },
+      { x: far, y: center },
+      { x: center, y: edge },
+      { x: center, y: far }
+    );
+  }
+  
+  if (size >= 9) {
+    points.push({ x: center, y: center });
+  }
+  
+  return points;
+};
+
+const pickAiMove = (board, color, difficulty, koBoard) => {
+  const size = board.length;
+  const relevantPositions = [];
+  
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      if (board[y][x] !== Stone.EMPTY) {
+        const maxDist = difficulty === 'easy' ? 2 : difficulty === 'medium' ? 3 : 4;
+        for (let dy = -maxDist; dy <= maxDist; dy++) {
+          for (let dx = -maxDist; dx <= maxDist; dx++) {
+            const nx = x + dx, ny = y + dy;
+            if (inBounds(nx, ny, size) && board[ny][nx] === Stone.EMPTY) {
+              relevantPositions.push({x: nx, y: ny});
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  if (relevantPositions.length < 10) {
+    const center = Math.floor(size / 2);
+    const strategic = [
+      { x: center, y: center },
+      { x: 3, y: 3 }, { x: size - 4, y: 3 },
+      { x: 3, y: size - 4 }, { x: size - 4, y: size - 4 }
+    ];
+    strategic.forEach(pos => {
+      if (inBounds(pos.x, pos.y, size) && board[pos.y][pos.x] === Stone.EMPTY) {
+        relevantPositions.push(pos);
+      }
+    });
+  }
+  
+  const unique = relevantPositions.filter((pos, i, arr) => 
+    arr.findIndex(p => p.x === pos.x && p.y === pos.y) === i
+  );
+  
+  const candidates = unique
+    .map(pos => {
+      const result = tryPlay(board, pos.x, pos.y, color, koBoard);
+      if (!result.legal) return null;
+      
+      const captures = result.captures || 0;
+      const neighbors = getNeighbors(pos.x, pos.y, size);
+      const friendlyNeighbors = neighbors.filter(n => board[n.y][n.x] === color).length;
+      const centerDist = Math.abs(Math.floor(size/2) - pos.x) + Math.abs(Math.floor(size/2) - pos.y);
+      
+      let score = captures * 25 + friendlyNeighbors * 10 - centerDist * 2 + Math.random() * 8;
+      
+      if (difficulty === 'easy') {
+        score += Math.random() * 20;
+      } else if (difficulty === 'hard') {
+        if ((pos.x === 0 || pos.x === size-1) && (pos.y === 0 || pos.y === size-1)) score += 15;
+        else if (pos.x === 0 || pos.x === size-1 || pos.y === 0 || pos.y === size-1) score += 8;
+      }
+      
+      return { position: pos, score };
+    })
+    .filter(Boolean);
+  
+  if (candidates.length === 0) return {x: -1, y: -1};
+  
+  candidates.sort((a, b) => b.score - a.score);
+  const topCount = difficulty === 'easy' ? 5 : difficulty === 'medium' ? 3 : 2;
+  const selected = candidates[Math.floor(Math.random() * Math.min(topCount, candidates.length))];
+  
+  return selected.position;
+};
+
+// ==================== COMPONENTS ====================
+const StoneComponent = ({ stone, size, isLastMove, isAnimating }) => {
+  if (stone === Stone.EMPTY) return null;
+  
+  const sizeClass = size === 'small' ? 'w-4 h-4' : size === 'medium' ? 'w-6 h-6' : 'w-8 h-8';
+  
+  return (
+    <div className={`${sizeClass} rounded-full transition-all duration-300 ${
+      stone === Stone.BLACK 
+        ? 'bg-gradient-to-br from-gray-700 via-gray-900 to-black shadow-lg' 
+        : 'bg-gradient-to-br from-white via-gray-50 to-gray-200 shadow-lg border-2 border-gray-300'
+    } ${isLastMove ? 'ring-2 ring-red-500 ring-offset-1 animate-pulse' : ''} ${
+      isAnimating ? 'animate-bounce' : ''
+    }`}>
+      <div className={`absolute top-0.5 left-0.5 w-1.5 h-1.5 rounded-full ${
+        stone === Stone.BLACK ? 'bg-gray-600 opacity-30' : 'bg-white opacity-60'
+      }`} />
+    </div>
+  );
+};
+
+const TimerDisplay = ({ expiryTimestamp, onExpire, isActive, color }) => {
+  const [timeLeft, setTimeLeft] = useState(0);
+
+  useEffect(() => {
+    if (!isActive) return;
+
+    const interval = setInterval(() => {
+      const now = new Date().getTime();
+      const distance = expiryTimestamp.getTime() - now;
+      
+      if (distance < 0) {
+        setTimeLeft(0);
+        onExpire();
+        clearInterval(interval);
+      } else {
+        setTimeLeft(Math.ceil(distance / 1000));
+      }
+    }, 100);
+
+    return () => clearInterval(interval);
+  }, [expiryTimestamp, onExpire, isActive]);
+
+  const isLowTime = timeLeft < 10;
+
+  return (
+    <div className={`text-center ${isLowTime ? 'animate-pulse' : ''}`}>
+      <div className="text-xs text-gray-400">Time</div>
+      <div className={`font-bold text-lg font-mono ${
+        isLowTime ? 'text-red-400' : 'text-white'
+      }`}>
+        {Math.floor(timeLeft / 60)}:{(timeLeft % 60).toString().padStart(2, '0')}
+      </div>
+    </div>
+  );
+};
+
+const TutorialModal = ({ isOpen, onClose }) => {
+  const [step, setStep] = useState(0);
+  
+  if (!isOpen) return null;
+  
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div className="bg-gradient-to-br from-white to-blue-50 p-8 rounded-3xl shadow-2xl max-w-lg w-full">
+        <h2 className="text-3xl font-bold mb-4 text-gray-800">Hướng dẫn chơi</h2>
+        <h3 className="text-xl font-semibold mb-3 text-blue-600">{TUTORIAL_STEPS[step].title}</h3>
+        <p className="text-gray-700 mb-4 text-lg">{TUTORIAL_STEPS[step].text}</p>
+        <p className="text-gray-600 mb-6 bg-yellow-50 p-3 rounded-xl border border-yellow-200">
+          <strong>Mẹo:</strong> {TUTORIAL_STEPS[step].tip}
+        </p>
+        <div className="flex justify-between gap-3">
+          <button
+            onClick={() => setStep(Math.max(0, step - 1))}
+            disabled={step === 0}
+            className="px-6 py-3 rounded-xl font-bold transition-all disabled:opacity-40 disabled:cursor-not-allowed bg-gradient-to-r from-gray-500 to-gray-600 text-white hover:from-gray-600 hover:to-gray-700"
+          >
+            Trước
+          </button>
+          <span className="flex items-center text-gray-600 font-medium">
+            {step + 1} / {TUTORIAL_STEPS.length}
+          </span>
+          <button
+            onClick={() => setStep(Math.min(TUTORIAL_STEPS.length - 1, step + 1))}
+            disabled={step === TUTORIAL_STEPS.length - 1}
+            className="px-6 py-3 rounded-xl font-bold transition-all disabled:opacity-40 disabled:cursor-not-allowed bg-gradient-to-r from-blue-500 to-blue-600 text-white hover:from-blue-600 hover:to-blue-700"
+          >
+            Tiếp
+          </button>
+          <button
+            onClick={onClose}
+            className="px-6 py-3 rounded-xl font-bold bg-gradient-to-r from-red-500 to-red-600 text-white hover:from-red-600 hover:to-red-700 transition-all"
+          >
+            Đóng
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const ScoreModal = ({ isOpen, scoreData, captures, komi, onClose, onNewGame }) => {
+  if (!isOpen || !scoreData) return null;
+  
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div className="bg-gradient-to-br from-white to-gray-50 p-8 rounded-3xl shadow-2xl max-w-md w-full">
+        <h2 className="text-3xl font-bold mb-6 text-center text-gray-800">Kết quả ván cờ</h2>
+        <div className="space-y-4">
+          <div className="bg-gray-800 text-white p-4 rounded-xl">
+            <div className="flex justify-between mb-2">
+              <span>Vùng đất Đen:</span>
+              <span className="font-bold">{scoreData.blackTerritory}</span>
+            </div>
+            <div className="flex justify-between mb-2">
+              <span>Quân bắt Đen:</span>
+              <span className="font-bold">{captures.black}</span>
+            </div>
+            <div className="flex justify-between pt-2 border-t border-gray-600">
+              <span className="font-bold">Tổng Đen:</span>
+              <span className="text-2xl font-bold">{scoreData.blackScore.toFixed(1)}</span>
+            </div>
+          </div>
+          
+          <div className="bg-gray-100 text-gray-800 p-4 rounded-xl border-2 border-gray-300">
+            <div className="flex justify-between mb-2">
+              <span>Vùng đất Trắng:</span>
+              <span className="font-bold">{scoreData.whiteTerritory}</span>
+            </div>
+            <div className="flex justify-between mb-2">
+              <span>Quân bắt Trắng:</span>
+              <span className="font-bold">{captures.white}</span>
+            </div>
+            <div className="flex justify-between mb-2">
+              <span>Komi:</span>
+              <span className="font-bold">{komi}</span>
+            </div>
+            <div className="flex justify-between pt-2 border-t-2 border-gray-400">
+              <span className="font-bold">Tổng Trắng:</span>
+              <span className="text-2xl font-bold">{scoreData.whiteScore.toFixed(1)}</span>
+            </div>
+          </div>
+          
+          <div className={`text-center py-6 rounded-xl font-bold text-3xl shadow-lg ${
+            scoreData.winner === 'draw'
+              ? 'bg-gradient-to-r from-yellow-400 to-yellow-500 text-white'
+              : scoreData.winner === 'black'
+              ? 'bg-gradient-to-r from-gray-800 to-black text-white'
+              : 'bg-gradient-to-r from-white to-gray-100 text-black border-4 border-gray-800'
+          }`}>
+            {scoreData.winner === 'draw' 
+              ? 'HÒA!' 
+              : `${scoreData.winner === 'black' ? 'ĐEN' : 'TRẮNG'} THẮNG!`}
+          </div>
+        </div>
+        
+        <div className="flex gap-3 mt-6">
+          <button
+            onClick={onClose}
+            className="flex-1 py-3 bg-gradient-to-r from-gray-500 to-gray-600 text-white rounded-xl hover:from-gray-600 hover:to-gray-700 font-bold transition-all"
+          >
+            Đóng
+          </button>
+          <button
+            onClick={onNewGame}
+            className="flex-1 py-3 bg-gradient-to-r from-blue-500 to-blue-600 text-white rounded-xl hover:from-blue-600 hover:to-blue-700 font-bold transition-all"
+          >
+            Ván mới
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ==================== MAIN COMPONENT ====================
+const GoGame = () => {
+  const [gameMode, setGameMode] = useState('local');
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [board, setBoard] = useState(() => makeEmptyBoard(settings.boardSize));
+  const [currentPlayer, setCurrentPlayer] = useState(Stone.BLACK);
+  const [captures, setCaptures] = useState({ black: 0, white: 0 });
+  const [moveHistory, setMoveHistory] = useState([]);
   const [passCount, setPassCount] = useState(0);
-  const [hoverPosition, setHoverPosition] = useState<Position | null>(null);
-  const [lastMove, setLastMove] = useState<Position | null>(null);
+  const [hoverPosition, setHoverPosition] = useState(null);
+  const [lastMove, setLastMove] = useState(null);
+  const [isLoadingAI, setIsLoadingAI] = useState(false);
   const [showScore, setShowScore] = useState(false);
-  const [gameScore, setGameScore] = useState<GameScore | null>(null);
-  const [timerExpiry, setTimerExpiry] = useState<Date>(() => {
+  const [scoreData, setScoreData] = useState(null);
+  const [showTutorial, setShowTutorial] = useState(false);
+  const [animatingCaptures, setAnimatingCaptures] = useState([]);
+  const [timerExpiry, setTimerExpiry] = useState(() => {
     const now = new Date();
     now.setSeconds(now.getSeconds() + settings.timePerMove);
     return now;
   });
   const [isTimerActive, setIsTimerActive] = useState(true);
-  const [showTutorial, setShowTutorial] = useState(false);
-  const [isLoadingAI, setIsLoadingAI] = useState(false);
+  const [gameStatus, setGameStatus] = useState('playing');
   
-  const koHistoryRef = useRef<StoneType[][] | null>(null);
-  const aiMoveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
-  const boardHistoryRef = useRef<StoneType[][][]>([]);
+  const koHistoryRef = useRef(null);
+  const aiTimeoutRef = useRef(null);
+  const boardHistoryRef = useRef([]);
 
-  const getAIColor = useCallback((): StoneType => {
-    return settings.humanColor === 'black' ? Stone.WHITE : Stone.BLACK;
-  }, [settings.humanColor]);
+  const getAIColor = useCallback(() => 
+    settings.humanColor === 'black' ? Stone.WHITE : Stone.BLACK
+  , [settings.humanColor]);
 
   const initializeGame = useCallback(() => {
     const newBoard = makeEmptyBoard(settings.boardSize);
@@ -64,120 +440,80 @@ const GoGame: React.FC = () => {
     setCurrentPlayer(Stone.BLACK);
     setCaptures({ black: 0, white: 0 });
     setMoveHistory([]);
-    setGameStatus('playing');
     setPassCount(0);
     setLastMove(null);
     setShowScore(false);
-    setGameScore(null);
+    setScoreData(null);
     setAnimatingCaptures([]);
+    setGameStatus('playing');
+    setIsTimerActive(true);
+    koHistoryRef.current = null;
+    boardHistoryRef.current = [];
+    
     setTimerExpiry(() => {
       const now = new Date();
       now.setSeconds(now.getSeconds() + settings.timePerMove);
       return now;
     });
-    setIsTimerActive(true);
-    koHistoryRef.current = null;
-    boardHistoryRef.current = [];
     
     if (gameMode === 'ai' && settings.humanColor === 'white') {
       setTimeout(() => handleAIMove(), 500);
     }
   }, [settings.boardSize, settings.humanColor, settings.timePerMove, gameMode]);
 
-  const cleanup = useCallback(() => {
-    if (aiMoveTimeoutRef.current) {
-      clearTimeout(aiMoveTimeoutRef.current);
-      aiMoveTimeoutRef.current = null;
-    }
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-  }, []);
+  useEffect(() => {
+    initializeGame();
+  }, [settings.boardSize]);
 
-  const isValidMove = useCallback((position: Position): boolean => {
-    const { x, y } = position;
-    if (!inBounds(x, y, board.length) || board[y][x] !== Stone.EMPTY || gameStatus !== 'playing') {
+  const isValidMove = useCallback((pos) => {
+    if (!inBounds(pos.x, pos.y, board.length) || board[pos.y][pos.x] !== Stone.EMPTY) 
       return false;
-    }
-    if (gameMode === 'ai' && currentPlayer === getAIColor()) {
-      return false;
-    }
-    const result = tryPlay(board, x, y, currentPlayer, koHistoryRef.current);
-    return result.legal;
-  }, [board, gameStatus, currentPlayer, gameMode, getAIColor]);
+    if (gameMode === 'ai' && currentPlayer === getAIColor()) return false;
+    if (gameStatus !== 'playing') return false;
+    return tryPlay(board, pos.x, pos.y, currentPlayer, koHistoryRef.current).legal;
+  }, [board, currentPlayer, gameMode, gameStatus, getAIColor]);
 
-  const calculateTerritory = useCallback((): { black: number; white: number } => {
+  const calculateScore = useCallback(() => {
+    const territory = { black: 0, white: 0 };
+    const visited = new Set();
     const size = board.length;
-    const visited = new Set<string>();
-    let blackTerritory = 0;
-    let whiteTerritory = 0;
-
-    const floodFill = (startX: number, startY: number): { owner: StoneType } => {
-      if (visited.has(`${startX},${startY}`) || board[startY][startX] !== Stone.EMPTY) {
-        return { owner: Stone.EMPTY };
-      }
-
-      const queue: Position[] = [{ x: startX, y: startY }];
-      const territory: Position[] = [];
-      const borderStones = new Set<StoneType>();
-
-      while (queue.length > 0) {
-        const current = queue.shift()!;
-        const key = `${current.x},${current.y}`;
-        
-        if (visited.has(key)) continue;
-        visited.add(key);
-        territory.push(current);
-
-        const neighbors = [
-          { x: current.x + 1, y: current.y },
-          { x: current.x - 1, y: current.y },
-          { x: current.x, y: current.y + 1 },
-          { x: current.x, y: current.y - 1 }
-        ];
-
-        for (const neighbor of neighbors) {
-          if (!inBounds(neighbor.x, neighbor.y, size)) continue;
+    
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        if (board[y][x] === Stone.EMPTY && !visited.has(`${x},${y}`)) {
+          const queue = [{x, y}];
+          const territoryGroup = [];
+          const borders = new Set();
           
-          const neighborStone = board[neighbor.y][neighbor.x];
-          if (neighborStone === Stone.EMPTY && !visited.has(`${neighbor.x},${neighbor.y}`)) {
-            queue.push(neighbor);
-          } else if (neighborStone !== Stone.EMPTY) {
-            borderStones.add(neighborStone);
+          while (queue.length > 0) {
+            const curr = queue.shift();
+            const key = `${curr.x},${curr.y}`;
+            if (visited.has(key)) continue;
+            
+            visited.add(key);
+            territoryGroup.push(curr);
+            
+            for (const n of getNeighbors(curr.x, curr.y, size)) {
+              const stone = board[n.y][n.x];
+              if (stone === Stone.EMPTY && !visited.has(`${n.x},${n.y}`)) {
+                queue.push(n);
+              } else if (stone !== Stone.EMPTY) {
+                borders.add(stone);
+              }
+            }
+          }
+          
+          if (borders.size === 1) {
+            const owner = Array.from(borders)[0];
+            if (owner === Stone.BLACK) territory.black += territoryGroup.length;
+            else territory.white += territoryGroup.length;
           }
         }
       }
-
-      if (borderStones.size === 1) {
-        const owner = Array.from(borderStones)[0];
-        if (owner === Stone.BLACK) {
-          blackTerritory += territory.length;
-        } else {
-          whiteTerritory += territory.length;
-        }
-        return { owner };
-      }
-
-      return { owner: Stone.EMPTY };
-    };
-
-    for (let y = 0; y < size; y++) {
-      for (let x = 0; x < size; x++) {
-        if (!visited.has(`${x},${y}`) && board[y][x] === Stone.EMPTY) {
-          floodFill(x, y);
-        }
-      }
     }
-
-    return { black: blackTerritory, white: whiteTerritory };
-  }, [board]);
-
-  const calculateScore = useCallback((): GameScore => {
-    const territory = calculateTerritory();
+    
     const blackScore = territory.black + captures.black;
     const whiteScore = territory.white + captures.white + settings.komi;
-    const winner = blackScore > whiteScore ? 'black' : whiteScore > blackScore ? 'white' : 'draw';
     
     return {
       blackScore,
@@ -185,69 +521,60 @@ const GoGame: React.FC = () => {
       blackTerritory: territory.black,
       whiteTerritory: territory.white,
       komi: settings.komi,
-      winner
+      winner: blackScore > whiteScore ? 'black' : whiteScore > blackScore ? 'white' : 'draw'
     };
-  }, [board, captures, settings.komi, calculateTerritory]);
+  }, [board, captures, settings.komi]);
 
   const handleAIMove = useCallback(() => {
-    if (gameStatus !== 'playing' || currentPlayer !== getAIColor()) return;
+    if (currentPlayer !== getAIColor() || gameStatus !== 'playing') return;
     
     setIsLoadingAI(true);
-    aiMoveTimeoutRef.current = setTimeout(() => {
-      try {
-        const aiMove = pickAiMove(board, currentPlayer, settings.difficulty, koHistoryRef.current);
-        setIsLoadingAI(false);
-        
-        if (aiMove && aiMove.x !== -1) {
-          handlePlaceStone(aiMove);
-        } else {
-          handlePass();
-        }
-      } catch (error) {
-        console.error('AI move error:', error);
-        setIsLoadingAI(false);
-        alert('Lỗi khi AI tính toán nước đi. Vui lòng thử lại.');
+    aiTimeoutRef.current = setTimeout(() => {
+      const aiMove = pickAiMove(board, currentPlayer, settings.difficulty, koHistoryRef.current);
+      setIsLoadingAI(false);
+      
+      if (aiMove.x !== -1) {
+        handlePlaceStone(aiMove);
+      } else {
+        handlePass();
       }
-    }, 100);
-  }, [board, currentPlayer, gameStatus, settings.difficulty, getAIColor]);
+    }, 400);
+  }, [board, currentPlayer, settings.difficulty, gameStatus, getAIColor]);
 
-  const handlePlaceStone = useCallback((position: Position) => {
-    if (!isValidMove(position) && !(gameMode === 'ai' && currentPlayer === getAIColor())) return;
+  const handlePlaceStone = useCallback((pos) => {
+    if (!isValidMove(pos) && !(gameMode === 'ai' && currentPlayer === getAIColor())) return;
     
-    const result = tryPlay(board, position.x, position.y, currentPlayer, koHistoryRef.current);
+    const result = tryPlay(board, pos.x, pos.y, currentPlayer, koHistoryRef.current);
     if (!result.legal || !result.board) return;
-
-    boardHistoryRef.current = [...boardHistoryRef.current, board];
-    koHistoryRef.current = result.captures === 1 ? board : null;
+    
+    boardHistoryRef.current = [...boardHistoryRef.current, copyBoard(board)];
+    koHistoryRef.current = result.captures === 1 ? copyBoard(board) : null;
     
     setBoard(result.board);
-    setLastMove(position);
+    setLastMove(pos);
     
     if (result.captures && result.captures > 0) {
       setCaptures(prev => ({
         ...prev,
         [currentPlayer === Stone.BLACK ? 'black' : 'white']: 
-          prev[currentPlayer === Stone.BLACK ? 'black' : 'white'] + result.captures!
+          prev[currentPlayer === Stone.BLACK ? 'black' : 'white'] + result.captures
       }));
       
       if (result.capturedPositions) {
         setAnimatingCaptures(result.capturedPositions);
-        animationFrameRef.current = requestAnimationFrame(() => {
-          setTimeout(() => setAnimatingCaptures([]), 600);
-        });
+        setTimeout(() => setAnimatingCaptures([]), 600);
       }
     }
     
-    const newMove: GameMove = {
+    setMoveHistory(prev => [...prev, {
       player: currentPlayer,
-      position,
+      position: pos,
       timestamp: Date.now(),
       captures: result.captures || 0,
-      boardState: produce(result.board, draft => draft)
-    };
+      boardState: copyBoard(result.board)
+    }]);
     
-    setMoveHistory(prev => [...prev, newMove]);
-    const nextPlayer: StoneType = currentPlayer === Stone.BLACK ? Stone.WHITE : Stone.BLACK;
+    const nextPlayer = currentPlayer === Stone.BLACK ? Stone.WHITE : Stone.BLACK;
     setCurrentPlayer(nextPlayer);
     setPassCount(0);
     
@@ -266,25 +593,23 @@ const GoGame: React.FC = () => {
     const newPassCount = passCount + 1;
     setPassCount(newPassCount);
     
-    const passMove: GameMove = {
+    setMoveHistory(prev => [...prev, {
       player: currentPlayer,
       position: { x: -1, y: -1 },
       timestamp: Date.now(),
       captures: 0,
       isPass: true,
-      boardState: produce(board, draft => draft)
-    };
-    
-    setMoveHistory(prev => [...prev, passMove]);
+      boardState: copyBoard(board)
+    }]);
     
     if (newPassCount >= 2) {
       setGameStatus('finished');
       const finalScore = calculateScore();
-      setGameScore(finalScore);
+      setScoreData(finalScore);
       setShowScore(true);
       setIsTimerActive(false);
     } else {
-      const nextPlayer: StoneType = currentPlayer === Stone.BLACK ? Stone.WHITE : Stone.BLACK;
+      const nextPlayer = currentPlayer === Stone.BLACK ? Stone.WHITE : Stone.BLACK;
       setCurrentPlayer(nextPlayer);
       
       setTimerExpiry(() => {
@@ -303,35 +628,34 @@ const GoGame: React.FC = () => {
     if (moveHistory.length === 0) return;
     
     const movesToUndo = gameMode === 'ai' ? 2 : 1;
-    const actualMovesToUndo = Math.min(movesToUndo, moveHistory.length);
+    const actualUndo = Math.min(movesToUndo, moveHistory.length);
+    const newHistory = moveHistory.slice(0, -actualUndo);
     
-    const newHistory = moveHistory.slice(0, -actualMovesToUndo);
     setMoveHistory(newHistory);
     
-    const previousBoard = boardHistoryRef.current[boardHistoryRef.current.length - actualMovesToUndo] || 
+    const previousBoard = boardHistoryRef.current[boardHistoryRef.current.length - actualUndo] || 
                          makeEmptyBoard(settings.boardSize);
     setBoard(previousBoard);
     
-    setLastMove(newHistory.length > 0 && !newHistory[newHistory.length - 1].isPass ? 
-                newHistory[newHistory.length - 1].position : null);
-    
-    let blackCaptures = 0;
-    let whiteCaptures = 0;
-    for (const move of newHistory) {
-      if (move.player === Stone.BLACK) blackCaptures += move.captures;
-      else whiteCaptures += move.captures;
-    }
-    setCaptures({ black: blackCaptures, white: whiteCaptures });
+    let newCaptures = { black: 0, white: 0 };
+    newHistory.forEach(move => {
+      if (move.player === Stone.BLACK) newCaptures.black += move.captures;
+      else newCaptures.white += move.captures;
+    });
+    setCaptures(newCaptures);
     
     setCurrentPlayer(newHistory.length > 0 ? 
       (newHistory[newHistory.length - 1].player === Stone.BLACK ? Stone.WHITE : Stone.BLACK) : 
       Stone.BLACK);
     
-    setPassCount(newHistory.slice(-2).filter(m => m.isPass).length);
-    setGameStatus('playing');
+    setLastMove(newHistory.length > 0 && !newHistory[newHistory.length - 1].isPass ? 
+      newHistory[newHistory.length - 1].position : null);
+    
+    setPassCount(0);
     setShowScore(false);
+    setGameStatus('playing');
     koHistoryRef.current = null;
-    boardHistoryRef.current = boardHistoryRef.current.slice(0, -actualMovesToUndo);
+    boardHistoryRef.current = boardHistoryRef.current.slice(0, -actualUndo);
     
     setTimerExpiry(() => {
       const now = new Date();
@@ -340,146 +664,29 @@ const GoGame: React.FC = () => {
     });
   }, [moveHistory, gameMode, settings.boardSize, settings.timePerMove]);
 
-  const saveGame = useCallback(() => {
-    try {
-      const sgf = exportToSGF(moveHistory, settings, gameScore || undefined);
-      const blob = new Blob([sgf], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `go_game_${new Date().toISOString().replace(/[:.]/g, '-')}.sgf`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (error) {
-      console.error('Save game error:', error);
-      alert('Lỗi khi lưu ván cờ. Vui lòng thử lại.');
-    }
-  }, [moveHistory, settings, gameScore]);
-
-  const loadGame = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    
-    const reader = new FileReader();
-    reader.onload = async (e) => {
-      const content = e.target?.result as string;
-      const gameData = importFromSGF(content);
-      if (!gameData) return;
-      
-      try {
-        setSettings(prev => ({ 
-          ...prev, 
-          boardSize: gameData.boardSize, 
-          komi: gameData.komi 
-        }));
-        
-        const newBoard = makeEmptyBoard(gameData.boardSize);
-        let currentBoard = newBoard;
-        let currentCaptures = { black: 0, white: 0 };
-        let koBoard: StoneType[][] | null = null;
-        const newMoveHistory: GameMove[] = [];
-        
-        for (const move of gameData.moves) {
-          if (move.position.x === -1 && move.position.y === -1) {
-            const passMove: GameMove = {
-              player: move.player,
-              position: move.position,
-              timestamp: Date.now(),
-              captures: 0,
-              isPass: true,
-              boardState: produce(currentBoard, draft => draft)
-            };
-            newMoveHistory.push(passMove);
-          } else {
-            const result = tryPlay(currentBoard, move.position.x, move.position.y, move.player, koBoard);
-            if (!result.legal || !result.board) continue;
-            
-            currentBoard = result.board;
-            if (result.captures && result.captures > 0) {
-              currentCaptures[move.player === Stone.BLACK ? 'black' : 'white'] += result.captures;
-            }
-            koBoard = result.captures === 1 ? currentBoard : null;
-            
-            const gameMove: GameMove = {
-              player: move.player,
-              position: move.position,
-              timestamp: Date.now(),
-              captures: result.captures || 0,
-              boardState: produce(currentBoard, draft => draft)
-            };
-            newMoveHistory.push(gameMove);
-            boardHistoryRef.current.push(currentBoard);
-          }
-        }
-        
-        setBoard(currentBoard);
-        setCaptures(currentCaptures);
-        setMoveHistory(newMoveHistory);
-        
-        const lastMove = newMoveHistory[newMoveHistory.length - 1];
-        setCurrentPlayer(lastMove ? 
-          (lastMove.player === Stone.BLACK ? Stone.WHITE : Stone.BLACK) : 
-          Stone.BLACK);
-        setLastMove(lastMove && !lastMove.isPass ? lastMove.position : null);
-        setPassCount(newMoveHistory.slice(-2).filter(m => m.isPass).length);
-        setGameStatus('playing');
-        setShowScore(false);
-        koHistoryRef.current = koBoard;
-        
-        event.target.value = '';
-      } catch (error) {
-        console.error('Load game error:', error);
-        alert('Lỗi khi tải ván cờ. Vui lòng kiểm tra định dạng SGF.');
-      }
-    };
-    
-    reader.onerror = () => alert('Lỗi khi đọc file. Vui lòng thử lại.');
-    reader.readAsText(file);
-  }, []);
-
-  // Fix: Reset game when board size changes
   useEffect(() => {
-    const newBoard = makeEmptyBoard(settings.boardSize);
-    setBoard(newBoard);
-    setCurrentPlayer(Stone.BLACK);
-    setCaptures({ black: 0, white: 0 });
-    setMoveHistory([]);
-    setGameStatus('playing');
-    setPassCount(0);
-    setLastMove(null);
-    setShowScore(false);
-    setGameScore(null);
-    setAnimatingCaptures([]);
-    koHistoryRef.current = null;
-    boardHistoryRef.current = [];
-  }, [settings.boardSize]);
-
-  useEffect(() => {
-    initializeGame();
-    return cleanup;
-  }, [initializeGame, cleanup]);
-
-  useEffect(() => {
-    if (gameMode === 'ai' && currentPlayer === getAIColor() && gameStatus === 'playing') {
-      handleAIMove();
-    }
-  }, [gameMode, currentPlayer, gameStatus, getAIColor, handleAIMove]);
-
-  useEffect(() => {
-    const handleKeyPress = (e: KeyboardEvent) => {
+    const handleKeyPress = (e) => {
       if (e.key === 'p' || e.key === 'P') handlePass();
       if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
         e.preventDefault();
         handleUndo();
       }
       if (e.key === 't' || e.key === 'T') setShowTutorial(true);
+      if (e.key === 'n' || e.key === 'N') initializeGame();
     };
     
     window.addEventListener('keydown', handleKeyPress);
     return () => window.removeEventListener('keydown', handleKeyPress);
-  }, [handlePass, handleUndo]);
+  }, [handlePass, handleUndo, initializeGame]);
 
-  // ========== RENDER BOARD (FIXED VERSION) ==========
+  useEffect(() => {
+    return () => {
+      if (aiTimeoutRef.current) {
+        clearTimeout(aiTimeoutRef.current);
+      }
+    };
+  }, []);
+
   const renderBoard = useMemo(() => {
     const size = settings.boardSize;
     const windowWidth = typeof window !== 'undefined' ? window.innerWidth : 800;
@@ -549,13 +756,7 @@ const GoGame: React.FC = () => {
           ))}
         </svg>
         
-        <div 
-          className="absolute inset-0"
-          style={{ 
-            padding,
-            pointerEvents: 'none' 
-          }}
-        >
+        <div className="absolute inset-0" style={{ padding, pointerEvents: 'none' }}>
           {board.map((row, y) =>
             row.map((stone, x) => {
               const isLastMovePosition = lastMove?.x === x && lastMove?.y === y;
@@ -629,22 +830,10 @@ const GoGame: React.FC = () => {
         )}
       </div>
     );
-  }, [
-    board, 
-    settings.boardSize, 
-    hoverPosition, 
-    lastMove,
-    isValidMove, 
-    handlePlaceStone, 
-    isLoadingAI, 
-    animatingCaptures,
-    currentPlayer
-  ]);
+  }, [board, settings.boardSize, hoverPosition, lastMove, isValidMove, handlePlaceStone, isLoadingAI, animatingCaptures, currentPlayer]);
 
-  // ========== PHẦN UI MỚI - PREMIUM DESIGN ==========
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900">
-      {/* Background Pattern */}
       <div className="fixed inset-0 opacity-20">
         <div className="absolute inset-0" style={{
           backgroundImage: `url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%239C92AC' fill-opacity='0.1'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E")`,
@@ -678,29 +867,10 @@ const GoGame: React.FC = () => {
               0 10px 40px rgba(0, 0, 0, 0.3),
               inset 0 1px 0 rgba(255, 255, 255, 0.2);
           }
-          @keyframes place-stone {
-            0% { transform: scale(0.5); opacity: 0.5; }
-            50% { transform: scale(1.2); opacity: 1; }
-            100% { transform: scale(1); opacity: 1; }
-          }
-          .animate-place-stone { animation: place-stone 0.3s ease-out; }
-          .shadow-stone-black {
-            box-shadow: 
-              2px 2px 6px rgba(0,0,0,0.7), 
-              inset -2px -2px 4px rgba(255,255,255,0.1),
-              0 0 10px rgba(0,0,0,0.3);
-          }
-          .shadow-stone-white {
-            box-shadow: 
-              2px 2px 6px rgba(0,0,0,0.4), 
-              inset -2px -2px 4px rgba(0,0,0,0.1),
-              0 0 10px rgba(255,255,255,0.5);
-          }
         `}
       </style>
 
       <div className="relative z-10 max-w-8xl mx-auto p-4 sm:p-6">
-        {/* Premium Header */}
         <header className="glass-effect rounded-2xl p-4 sm:p-6 mb-6 neo-shadow">
           <div className="flex flex-col lg:flex-row justify-between items-center gap-4">
             <div className="flex items-center gap-4">
@@ -718,14 +888,13 @@ const GoGame: React.FC = () => {
               </div>
             </div>
 
-            {/* Game Status Bar */}
             <div className="flex items-center gap-3 sm:gap-6">
               <div className="flex items-center gap-3 glass-effect rounded-xl px-4 py-2">
                 <div className="flex items-center gap-2">
                   <div className={`w-8 h-8 rounded-full float-animation ${
                     currentPlayer === Stone.BLACK
-                      ? 'bg-gradient-to-br from-gray-800 to-black shadow-stone-black'
-                      : 'bg-gradient-to-br from-white to-gray-200 shadow-stone-white'
+                      ? 'bg-gradient-to-br from-gray-800 to-black shadow-lg'
+                      : 'bg-gradient-to-br from-white to-gray-200 shadow-lg border-2 border-gray-300'
                   }`} />
                   <div className="text-white">
                     <div className="text-xs text-gray-400">Current</div>
@@ -739,7 +908,6 @@ const GoGame: React.FC = () => {
                 </div>
               </div>
 
-              {/* Timer with modern design */}
               <div className={`glass-effect rounded-xl px-4 py-2 ${
                 isTimerActive ? 'border-red-500' : 'border-gray-500'
               }`}>
@@ -767,11 +935,8 @@ const GoGame: React.FC = () => {
           </div>
         </header>
 
-        {/* Main Game Area */}
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
-          {/* Left Sidebar - Game Controls */}
           <div className="xl:col-span-3 space-y-4 order-2 xl:order-1">
-            {/* Game Mode Selector */}
             <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
               <h3 className="text-white font-bold mb-3 flex items-center gap-2">
                 <span className="text-xl">🎮</span> Game Mode
@@ -802,7 +967,6 @@ const GoGame: React.FC = () => {
               </div>
             </div>
 
-            {/* Statistics */}
             <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
               <h3 className="text-white font-bold mb-3 flex items-center gap-2">
                 <span className="text-xl">📊</span> Statistics
@@ -820,7 +984,7 @@ const GoGame: React.FC = () => {
                   <button 
                     onClick={() => {
                       const score = calculateScore();
-                      setGameScore(score);
+                      setScoreData(score);
                       setShowScore(true);
                     }}
                     className="text-purple-400 hover:text-purple-300 text-sm font-medium"
@@ -839,7 +1003,6 @@ const GoGame: React.FC = () => {
               </div>
             </div>
 
-            {/* Quick Actions */}
             <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
               <h3 className="text-white font-bold mb-3 flex items-center gap-2">
                 <span className="text-xl">⚡</span> Quick Actions
@@ -868,7 +1031,7 @@ const GoGame: React.FC = () => {
                 <button
                   onClick={() => {
                     const score = calculateScore();
-                    setGameScore(score);
+                    setScoreData(score);
                     setShowScore(true);
                     setIsTimerActive(false);
                   }}
@@ -880,7 +1043,6 @@ const GoGame: React.FC = () => {
             </div>
           </div>
 
-          {/* Center - Game Board */}
           <div className="xl:col-span-6 order-1 xl:order-2">
             <div className="glass-effect rounded-2xl p-4 sm:p-6 neo-shadow">
               <div className="flex justify-center">
@@ -889,9 +1051,7 @@ const GoGame: React.FC = () => {
             </div>
           </div>
 
-          {/* Right Sidebar - Settings */}
           <div className="xl:col-span-3 space-y-4 order-3">
-            {/* Settings Panel */}
             <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
               <h3 className="text-white font-bold mb-3 flex items-center gap-2">
                 <span className="text-xl">⚙️</span> Settings
@@ -917,7 +1077,7 @@ const GoGame: React.FC = () => {
                     <div>
                       <label className="text-gray-400 text-sm block mb-2">AI Difficulty</label>
                       <div className="grid grid-cols-3 gap-1">
-                        {(['easy', 'medium', 'hard'] as const).map(level => (
+                        {['easy', 'medium', 'hard'].map(level => (
                           <button
                             key={level}
                             onClick={() => setSettings(prev => ({ ...prev, difficulty: level }))}
@@ -963,7 +1123,7 @@ const GoGame: React.FC = () => {
 
                 <div>
                   <label className="text-gray-400 text-sm block mb-2">
-                    Time per Move
+                    Time per Move: {settings.timePerMove}s
                   </label>
                   <input
                     type="range"
@@ -973,48 +1133,10 @@ const GoGame: React.FC = () => {
                     onChange={(e) => setSettings(prev => ({ ...prev, timePerMove: Number(e.target.value) }))}
                     className="w-full"
                   />
-                  <div className="text-white text-center text-sm mt-1">
-                    {settings.timePerMove}s
-                  </div>
                 </div>
               </div>
             </div>
 
-            {/* Save/Load Panel */}
-            <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
-              <h3 className="text-white font-bold mb-3 flex items-center gap-2">
-                <span className="text-xl">💾</span> Game Data
-              </h3>
-              <div className="space-y-2">
-                <button
-                  onClick={saveGame}
-                  className="w-full py-2 px-3 rounded-xl bg-gradient-to-r from-purple-600 to-violet-600 text-white font-medium hover:from-purple-700 hover:to-violet-700 transition-all duration-200 neo-shadow flex items-center justify-center gap-2"
-                >
-                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                    <path d="M7 9a2 2 0 012-2h6a2 2 0 012 2v6a2 2 0 01-2 2H9a2 2 0 01-2-2V9z"/>
-                    <path d="M5 3a2 2 0 00-2 2v6a2 2 0 002 2V5h8a2 2 0 00-2-2H5z"/>
-                  </svg>
-                  Export SGF
-                </button>
-                <label className="block">
-                  <input
-                    type="file"
-                    accept=".sgf"
-                    onChange={loadGame}
-                    className="hidden"
-                  />
-                  <div className="w-full py-2 px-3 rounded-xl glass-effect text-gray-300 font-medium hover:bg-white/20 transition-all duration-200 cursor-pointer flex items-center justify-center gap-2">
-                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                      <path d="M8 2a1 1 0 000 2h2a1 1 0 100-2H8z"/>
-                      <path d="M3 5a2 2 0 012-2 1 1 0 000 2H5v7h2l1 2h4l1-2h2V5h2a1 1 0 100-2 2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V5a2 2 0 00-2-2z"/>
-                    </svg>
-                    Import SGF
-                  </div>
-                </label>
-              </div>
-            </div>
-
-            {/* Keyboard Shortcuts */}
             <div className="glass-effect rounded-2xl p-4 neo-shadow slide-in">
               <h3 className="text-white font-bold mb-3 flex items-center gap-2">
                 <span className="text-xl">⌨️</span> Shortcuts
@@ -1038,7 +1160,6 @@ const GoGame: React.FC = () => {
           </div>
         </div>
 
-        {/* Bottom Status Bar */}
         <div className="mt-6 glass-effect rounded-2xl p-3 neo-shadow">
           <div className="flex flex-wrap justify-center gap-2 sm:gap-4 text-xs sm:text-sm">
             <div className="flex items-center gap-2 text-gray-400">
@@ -1057,12 +1178,12 @@ const GoGame: React.FC = () => {
         </div>
       </div>
 
-      {/* Modals */}
       <TutorialModal isOpen={showTutorial} onClose={() => setShowTutorial(false)} />
       <ScoreModal
         isOpen={showScore}
-        gameScore={gameScore}
+        scoreData={scoreData}
         captures={captures}
+        komi={settings.komi}
         onClose={() => setShowScore(false)}
         onNewGame={() => {
           setShowScore(false);
